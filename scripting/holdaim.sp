@@ -8,17 +8,18 @@
 #include <sourcemod>
 #include <dhooks>
 #include <sdkhooks>
+#include <sdktools>
 
 // ================================================================
 // Info
 // ================================================================
 
 public Plugin myinfo = {
-    name        = "HoldAim",
-    author      = "RenardDev",
+    name = "HoldAim",
+    author = "RenardDev",
     description = "HoldAim",
-    version     = "1.0.0",
-    url         = "https://github.com/RenardDev/L4D2-HoldAim"
+    version = "1.0.0",
+    url = "https://github.com/RenardDev/L4D2-HoldAim"
 };
 
 // ================================================================
@@ -50,13 +51,13 @@ int g_nHookIDPre[MAXPLAYERS + 1] = { INVALID_HOOK_ID, ... };
 int g_nHookIDPost[MAXPLAYERS + 1] = { INVALID_HOOK_ID, ... };
 
 // ================================================================
-// Netvar offsets (resolved by netclass)
+// Netvar offsets
 // ================================================================
 
 bool g_bEyeOffsetsReady = false;
-int  g_nEyePitchOffset = -1;
-int  g_nEyeYawOffset = -1;
-int  g_nEyeRollOffset = -1;
+int g_nEyePitchOffset = -1;
+int g_nEyeYawOffset = -1;
+int g_nEyeRollOffset = -1;
 
 // ================================================================
 // State
@@ -66,6 +67,8 @@ float g_flEyeAnglesPre[MAXPLAYERS + 1][3];
 
 int g_nForceUntilTick[MAXPLAYERS + 1];
 float g_flForcedEyeAngles[MAXPLAYERS + 1][3];
+
+bool  g_bAttackCmdThisRun[MAXPLAYERS + 1];
 
 // ================================================================
 // Utils
@@ -107,23 +110,11 @@ static bool ResolveEyeAnglesOffsetsForEntity(int nEntity) {
         return false;
     }
 
-    int nPitch = FindSendPropInfo(szNetClass, "m_angEyeAngles[0]");
-    int nYaw = FindSendPropInfo(szNetClass, "m_angEyeAngles[1]");
-    int nRoll = FindSendPropInfo(szNetClass, "m_angEyeAngles[2]");
-
-    if ((nPitch > 0) && (nYaw > 0)) {
-        g_nEyePitchOffset = nPitch;
-        g_nEyeYawOffset = nYaw;
-        g_nEyeRollOffset = (nRoll > 0) ? nRoll : -1;
-        g_bEyeOffsetsReady = true;
-        return true;
-    }
-
-    int nBase = FindSendPropInfo(szNetClass, "m_angEyeAngles");
-    if (nBase > 0) {
-        g_nEyePitchOffset = nBase + 0;
-        g_nEyeYawOffset = nBase + 4;
-        g_nEyeRollOffset = nBase + 8;
+    int nOffset = FindSendPropInfo(szNetClass, "m_angEyeAngles[0]");
+    if (nOffset > 0) {
+        g_nEyePitchOffset = nOffset;
+        g_nEyeYawOffset = nOffset + 4;
+        g_nEyeRollOffset = nOffset + 8;
         g_bEyeOffsetsReady = true;
         return true;
     }
@@ -138,10 +129,7 @@ static void ForceSendEyeAngles(int nClient, const float flAngles[3]) {
 
     SetEntDataFloat(nClient, g_nEyePitchOffset, flAngles[ANGLE_PITCH], true);
     SetEntDataFloat(nClient, g_nEyeYawOffset, flAngles[ANGLE_YAW], true);
-
-    if (g_nEyeRollOffset > 0) {
-        SetEntDataFloat(nClient, g_nEyeRollOffset, flAngles[ANGLE_ROLL], true);
-    }
+    SetEntDataFloat(nClient, g_nEyeRollOffset, flAngles[ANGLE_ROLL], true);
 }
 
 static void ResetClientState(int nClient) {
@@ -154,6 +142,26 @@ static void ResetClientState(int nClient) {
     g_flForcedEyeAngles[nClient][ANGLE_PITCH] = 0.0;
     g_flForcedEyeAngles[nClient][ANGLE_YAW] = 0.0;
     g_flForcedEyeAngles[nClient][ANGLE_ROLL] = 0.0;
+
+    g_bAttackCmdThisRun[nClient] = false;
+}
+
+static bool IsAttackButtons(DHookParam hParams) {
+    Address pUserCmd = view_as<Address>(hParams.GetAddress(1));
+    if (pUserCmd == Address_Null) {
+        return false;
+    }
+
+    int nButtons = LoadFromAddress(pUserCmd + view_as<Address>(36), NumberType_Int32);
+    if (nButtons) {
+        if ((nButtons & (IN_ATTACK | IN_ATTACK2)) != 0) {
+            return true;
+        }
+
+        return false;
+    }
+
+    return false;
 }
 
 // ================================================================
@@ -263,14 +271,14 @@ public void OnPluginStart() {
     );
 
     g_ConVarForceTicks = CreateConVar(
-        "sm_holdaim_force_ticks", "3",
+        "sm_holdaim_force_ticks", "1",
         "How many server ticks to force m_angEyeAngles replication after a large delta",
         FCVAR_NOTIFY, true, 1.0, true, 16.0
     );
 
     g_ConVarForceDelta = CreateConVar(
         "sm_holdaim_force_delta", "0.5",
-        "Minimal (pitch/yaw) delta length to trigger forced replication",
+        "Minimal (pitch/yaw) delta length to trigger forced replication (only when IN_ATTACK/IN_ATTACK2)",
         FCVAR_NOTIFY, true, 0.0, true, 180.0
     );
 
@@ -329,7 +337,7 @@ public void OnClientDisconnect(int nClient) {
 }
 
 // ================================================================
-// SDKHooks callback (late, good for replication)
+// SDKHooks callback
 // ================================================================
 
 public void Hook_PostThinkPost(int nClient) {
@@ -356,12 +364,17 @@ public void Hook_PostThinkPost(int nClient) {
 // DHooks callbacks
 // ================================================================
 
-public MRESReturn Hook_PlayerRunCommand_Pre(int nClient, DHookReturn hReturn, DHookParam hParams) {
+public MRESReturn Hook_PlayerRunCommand_Pre(int nClient, DHookParam hParams) {
     if (!g_ConVarEnable.BoolValue) {
         return MRES_Ignored;
     }
 
     if (!IsValidClient(nClient)) {
+        return MRES_Ignored;
+    }
+
+    g_bAttackCmdThisRun[nClient] = IsAttackButtons(hParams);
+    if (!g_bAttackCmdThisRun[nClient]) {
         return MRES_Ignored;
     }
 
@@ -370,12 +383,16 @@ public MRESReturn Hook_PlayerRunCommand_Pre(int nClient, DHookReturn hReturn, DH
     return MRES_Ignored;
 }
 
-public MRESReturn Hook_PlayerRunCommand_Post(int nClient, DHookReturn hReturn, DHookParam hParams) {
+public MRESReturn Hook_PlayerRunCommand_Post(int nClient, DHookParam hParams) {
     if (!g_ConVarEnable.BoolValue) {
         return MRES_Ignored;
     }
 
     if (!IsValidClient(nClient)) {
+        return MRES_Ignored;
+    }
+
+    if (!g_bAttackCmdThisRun[nClient]) {
         return MRES_Ignored;
     }
 
@@ -389,7 +406,7 @@ public MRESReturn Hook_PlayerRunCommand_Post(int nClient, DHookReturn hReturn, D
     GetClientEyeAngles(nClient, flEyeAnglesPost);
 
     float flDeltaPitch = AngleDifference(flEyeAnglesPost[ANGLE_PITCH], g_flEyeAnglesPre[nClient][ANGLE_PITCH]);
-    float flDeltaYaw = AngleDifference(flEyeAnglesPost[ANGLE_YAW],   g_flEyeAnglesPre[nClient][ANGLE_YAW]);
+    float flDeltaYaw = AngleDifference(flEyeAnglesPost[ANGLE_YAW], g_flEyeAnglesPre[nClient][ANGLE_YAW]);
     float flDeltaLen = Vector2Length(flDeltaPitch, flDeltaYaw);
 
     float flTrigger = g_ConVarForceDelta.FloatValue;
@@ -410,8 +427,8 @@ public MRESReturn Hook_PlayerRunCommand_Post(int nClient, DHookReturn hReturn, D
 
     if (!bAlreadyForcing) {
         g_flForcedEyeAngles[nClient][ANGLE_PITCH] = flEyeAnglesPost[ANGLE_PITCH];
-        g_flForcedEyeAngles[nClient][ANGLE_YAW] = flEyeAnglesPost[ANGLE_YAW];
-        g_flForcedEyeAngles[nClient][ANGLE_ROLL] = 0.0;
+        g_flForcedEyeAngles[nClient][ANGLE_YAW]   = flEyeAnglesPost[ANGLE_YAW];
+        g_flForcedEyeAngles[nClient][ANGLE_ROLL]  = 0.0;
     }
 
     if (g_nForceUntilTick[nClient] < nNewUntil) {
